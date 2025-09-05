@@ -30,8 +30,8 @@ This is a powerful and user-friendly Telegram bot built with Node.js and Telegra
     ```
 
 3.  **Configure your bot token:**
-    -   Rename the `.env.example` file to `.env`.
-    -   Open the `.env` file and replace `YOUR_TELEGRAM_BOT_TOKEN` with your actual token from BotFather.
+    -   Create a file named `.env` in the root of the project.
+    -   Add the following line to the `.env` file, replacing `YOUR_TELEGRAM_BOT_TOKEN` with your actual token from BotFather:
     ```
     TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
     ```
