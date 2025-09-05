@@ -1,0 +1,12 @@
+# Dependencies
+/node_modules
+
+# Environment variables
+.env
+
+# Source files to exclude
+dramabox-api.js
+obfuscate.js
+
+# Log files
+*.log

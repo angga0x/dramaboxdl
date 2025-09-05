@@ -1,5 +1,5 @@
 const { Telegraf, Markup } = require('telegraf');
-const { fetchAllDramaData } = require('./dramabox-api');
+const { fetchAllDramaData } = require('./dramabox-api.obfuscated.js');
 const logger = require('./logger');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
