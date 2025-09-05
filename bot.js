@@ -1,9 +1,6 @@
 const { Telegraf, Markup } = require('telegraf');
 const { fetchAllDramaData } = require('./dramabox-api.obfuscated.js');
 const logger = require('./logger');
-const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const bot = new Telegraf(token);
@@ -90,21 +87,6 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// Helper function to download a file and return a promise
-function downloadFile(url, dest) {
-    return new Promise(async (resolve, reject) => {
-        try {
-            const response = await axios({ url, method: 'GET', responseType: 'stream' });
-            const writer = fs.createWriteStream(dest);
-            response.data.pipe(writer);
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-        } catch (error) {
-            reject(error);
-        }
-    });
-}
-
 bot.on('callback_query', async (ctx) => {
     const chatId = ctx.chat.id;
     const messageId = ctx.callbackQuery.message.message_id;
@@ -117,7 +99,6 @@ bot.on('callback_query', async (ctx) => {
         const chapterList = apiCache.get(bid);
 
         if (!chapterList) {
-            logger.error(`Cache miss for bookId: ${bid}. User: ${ctx.from.username}`);
             return ctx.answerCbQuery('Session expired. Please send the DramaBox link again.', { show_alert: true });
         }
 
@@ -131,76 +112,77 @@ bot.on('callback_query', async (ctx) => {
         const chapterId = args[0];
         const chapter = chapterList.find(c => c.chapterId === chapterId);
         if (!chapter) {
-            logger.error(`Chapter not found: ${chapterId} for bookId: ${bid}`);
             return ctx.answerCbQuery('Chapter not found. Please try again.');
         }
 
         if (type === 'c') {
-            const nakaCdn = chapter.cdnList.find(cdn => cdn.cdnDomain === "nakavideo.dramaboxdb.com");
-            const cdnToUse = nakaCdn || chapter.cdnList[0];
-            const qualityButtons = cdnToUse.videoPathList.map(video =>
+            const qualityButtons = chapter.cdnList[0].videoPathList.map(video =>
                 Markup.button.callback(`${video.quality}p`, `q:${chapterId}:${video.quality}:${bid}`)
             );
             await ctx.telegram.editMessageCaption(chatId, messageId, undefined, `Select quality for ${chapter.chapterName}`, {
                 ...Markup.inlineKeyboard(qualityButtons, { columns: 3 })
             });
-            logger.info(`Sent quality selection to ${ctx.from.username} for chapter: ${chapter.chapterName}`);
         
         } else if (type === 'q') {
             const quality = args[1];
-            const nakaCdn = chapter.cdnList.find(cdn => cdn.cdnDomain === "nakavideo.dramaboxdb.com");
-            const cdnToUse = nakaCdn || chapter.cdnList[0];
-            const video = cdnToUse.videoPathList.find(v => v.quality == quality);
+            await ctx.deleteMessage(messageId).catch(err => logger.warn(err, 'Failed to delete previous message.'));
+            const loadingMessage = await ctx.reply(`🔄 Mengambil ${chapter.chapterName}...`);
 
-            if (video) {
-                await ctx.deleteMessage(messageId).catch(err => logger.warn(err, 'Failed to delete previous message.'));
-                const loadingMessage = await ctx.reply(`🔄 Mengambil ${chapter.chapterName}...`);
-                
-                const tempDir = './temp';
-                if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
-                const tempFilePath = path.join(tempDir, `${chapterId}.mp4`);
-                
-                try {
-                    await downloadFile(video.videoPath, tempFilePath);
-                    logger.info(`Downloaded video to ${tempFilePath}`);
+            let videoSent = false;
+            // Prioritize 'nakavideo' but try all available CDNs
+            const sortedCdnList = [...chapter.cdnList].sort((a, b) => {
+                if (a.cdnDomain === 'nakavideo.dramaboxdb.com') return -1;
+                if (b.cdnDomain === 'nakavideo.dramaboxdb.com') return 1;
+                return 0;
+            });
 
-                    const currentChapterIndex = chapterList.findIndex(c => c.chapterId === chapterId);
-                    const prevChapter = (currentChapterIndex > 0) ? chapterList[currentChapterIndex - 1] : null;
-                    const nextChapter = (currentChapterIndex < chapterList.length - 1) ? chapterList[currentChapterIndex + 1] : null;
+            for (const cdn of sortedCdnList) {
+                const video = cdn.videoPathList.find(v => v.quality == quality);
+                if (video) {
+                    try {
+                        logger.info(`Attempting to send video from CDN: ${cdn.cdnDomain}`);
+                        const currentChapterIndex = chapterList.findIndex(c => c.chapterId === chapterId);
+                        const prevChapter = (currentChapterIndex > 0) ? chapterList[currentChapterIndex - 1] : null;
+                        const nextChapter = (currentChapterIndex < chapterList.length - 1) ? chapterList[currentChapterIndex + 1] : null;
 
-                    const navigationButtons = [];
-                    if (prevChapter) navigationButtons.push(Markup.button.callback(`⬅️ Previous (${prevChapter.chapterName})`, `c:${prevChapter.chapterId}:${bid}`));
-                    if (nextChapter) navigationButtons.push(Markup.button.callback(`Next ➡️ (${nextChapter.chapterName})`, `c:${nextChapter.chapterId}:${bid}`));
+                        const navigationButtons = [];
+                        if (prevChapter) navigationButtons.push(Markup.button.callback(`⬅️ Previous (${prevChapter.chapterName})`, `c:${prevChapter.chapterId}:${bid}`));
+                        if (nextChapter) navigationButtons.push(Markup.button.callback(`Next ➡️ (${nextChapter.chapterName})`, `c:${nextChapter.chapterId}:${bid}`));
 
-                    const replyMarkup = navigationButtons.length > 0 ? Markup.inlineKeyboard(navigationButtons) : undefined;
+                        const replyMarkup = navigationButtons.length > 0 ? Markup.inlineKeyboard(navigationButtons) : undefined;
 
-                    await ctx.replyWithVideo({ source: tempFilePath }, {
-                        caption: `🎬 *${chapter.chapterName}*`,
-                        parse_mode: 'Markdown',
-                        ...replyMarkup
-                    });
-                    
-                    await ctx.deleteMessage(loadingMessage.message_id);
-                    fs.unlinkSync(tempFilePath);
-                    logger.info(`Sent video and cleaned up temp file for ${chapter.chapterName}`);
-
-                    let session = userSessions.get(chatId) || { videosSent: 0 };
-                    session.videosSent++;
-                    userSessions.set(chatId, session);
-
-                    if (session.videosSent % 3 === 0) {
-                        await ctx.reply(`📡 ✅ Episode ${chapter.chapterName} berhasil dikirim.\nInfo update follow channel telegram : t.me/onesecvip`);
-                        logger.info(`Sent promotional message to ${ctx.from.username}`);
+                        await ctx.replyWithVideo(video.videoPath, {
+                            caption: `🎬 *${chapter.chapterName}*`,
+                            parse_mode: 'Markdown',
+                            ...replyMarkup
+                        });
+                        
+                        videoSent = true;
+                        logger.info(`Successfully sent video from ${cdn.cdnDomain}`);
+                        break; // Exit loop on success
+                    } catch (error) {
+                        if (error.description === 'Bad Request: wrong type of the web page content') {
+                            logger.warn(`CDN failed: ${cdn.cdnDomain}. Trying next CDN.`);
+                        } else {
+                            throw error; // Re-throw unexpected errors
+                        }
                     }
-                } catch (downloadError) {
-                    logger.error(downloadError, 'Failed to download or send video file.');
-                    await ctx.deleteMessage(loadingMessage.message_id).catch(err => logger.warn(err, 'Failed to delete loading message.'));
-                    ctx.reply('Sorry, there was an error downloading the video. Please try again.');
                 }
+            }
 
+            await ctx.deleteMessage(loadingMessage.message_id);
+
+            if (videoSent) {
+                let session = userSessions.get(chatId) || { videosSent: 0 };
+                session.videosSent++;
+                userSessions.set(chatId, session);
+
+                if (session.videosSent % 3 === 0) {
+                    await ctx.reply(`📡 ✅ Episode ${chapter.chapterName} berhasil dikirim.\nInfo update follow channel telegram : t.me/onesecvip`);
+                }
             } else {
-                logger.error(`Video quality not found: ${quality} for chapter: ${chapter.chapterName}`);
-                await ctx.answerCbQuery('Video quality not found.');
+                logger.error(`All CDNs failed for chapter: ${chapter.chapterName}, quality: ${quality}`);
+                ctx.reply('Sorry, we could not send this video at the moment. Please try another quality or episode.');
             }
         }
     } catch (error) {
