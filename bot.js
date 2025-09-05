@@ -1,15 +1,17 @@
 const { Telegraf, Markup } = require('telegraf');
 const { fetchAllDramaData } = require('./dramabox-api.obfuscated.js');
 const logger = require('./logger');
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const bot = new Telegraf(token);
 
 const apiCache = new Map();
-const userSessions = new Map(); // To track user activity
+const userSessions = new Map();
 const PAGE_SIZE = 10;
 
-// Helper function to create the paginated keyboard
 function createChapterKeyboard(chapterList, bid, page = 0) {
     const start = page * PAGE_SIZE;
     const end = start + PAGE_SIZE;
@@ -38,16 +40,14 @@ function createChapterKeyboard(chapterList, bid, page = 0) {
     ]);
 }
 
-
 bot.start((ctx) => {
   logger.info(`Received /start command from ${ctx.from.username}`);
-  userSessions.set(ctx.chat.id, { videosSent: 0 }); // Initialize session
+  userSessions.set(ctx.chat.id, { videosSent: 0 });
   ctx.reply("🎬 Selamat datang di DramaBox Streaming Bot! Hanya kirim URL saja...");
 });
 
 bot.on('text', async (ctx) => {
   const text = ctx.message.text;
-
   if (text.includes('https://app.dramaocean.com/db_land_page/')) {
     logger.info(`Received a DramaBox link from ${ctx.from.username}: ${text}`);
     try {
@@ -65,7 +65,6 @@ bot.on('text', async (ctx) => {
         }
 
         const { bookName, bookCover, introduction, playCount, chapterList, chapterCount } = fullData;
-
         apiCache.set(bid, chapterList);
         logger.info(`Cached ${chapterList.length} chapters for bookId: ${bid}`);
         
@@ -91,6 +90,21 @@ bot.on('text', async (ctx) => {
   }
 });
 
+// Helper function to download a file and return a promise
+function downloadFile(url, dest) {
+    return new Promise(async (resolve, reject) => {
+        try {
+            const response = await axios({ url, method: 'GET', responseType: 'stream' });
+            const writer = fs.createWriteStream(dest);
+            response.data.pipe(writer);
+            writer.on('finish', resolve);
+            writer.on('error', reject);
+        } catch (error) {
+            reject(error);
+        }
+    });
+}
+
 bot.on('callback_query', async (ctx) => {
     const chatId = ctx.chat.id;
     const messageId = ctx.callbackQuery.message.message_id;
@@ -99,83 +113,91 @@ bot.on('callback_query', async (ctx) => {
 
     try {
         const [type, ...args] = rawData.split(':');
-        
-        let bid, chapterId, quality, page;
+        const bid = args[args.length - 1];
+        const chapterList = apiCache.get(bid);
 
-        const chapterList = apiCache.get(args[args.length - 1]);
         if (!chapterList) {
-            logger.error(`Cache miss for bookId: ${args[args.length - 1]}. User: ${ctx.from.username}`);
+            logger.error(`Cache miss for bookId: ${bid}. User: ${ctx.from.username}`);
             return ctx.answerCbQuery('Session expired. Please send the DramaBox link again.', { show_alert: true });
         }
 
         if (type === 'p') {
-            [page, bid] = args;
+            const [page] = args;
             const keyboard = createChapterKeyboard(chapterList, bid, parseInt(page, 10));
             await ctx.editMessageReplyMarkup(keyboard.reply_markup);
             return ctx.answerCbQuery();
         }
 
-        const chapter = chapterList.find(c => c.chapterId === args[0]);
+        const chapterId = args[0];
+        const chapter = chapterList.find(c => c.chapterId === chapterId);
         if (!chapter) {
-            logger.error(`Chapter not found: ${args[0]} for bookId: ${args[args.length - 1]}`);
+            logger.error(`Chapter not found: ${chapterId} for bookId: ${bid}`);
             return ctx.answerCbQuery('Chapter not found. Please try again.');
         }
 
         if (type === 'c') {
-            [chapterId, bid] = args;
             const nakaCdn = chapter.cdnList.find(cdn => cdn.cdnDomain === "nakavideo.dramaboxdb.com");
             const cdnToUse = nakaCdn || chapter.cdnList[0];
-
             const qualityButtons = cdnToUse.videoPathList.map(video =>
-                Markup.button.callback(`${video.quality}p`, `q:${chapter.chapterId}:${video.quality}:${bid}`)
+                Markup.button.callback(`${video.quality}p`, `q:${chapterId}:${video.quality}:${bid}`)
             );
-
             await ctx.telegram.editMessageCaption(chatId, messageId, undefined, `Select quality for ${chapter.chapterName}`, {
                 ...Markup.inlineKeyboard(qualityButtons, { columns: 3 })
             });
             logger.info(`Sent quality selection to ${ctx.from.username} for chapter: ${chapter.chapterName}`);
         
         } else if (type === 'q') {
-            [chapterId, quality, bid] = args;
+            const quality = args[1];
             const nakaCdn = chapter.cdnList.find(cdn => cdn.cdnDomain === "nakavideo.dramaboxdb.com");
             const cdnToUse = nakaCdn || chapter.cdnList[0];
-
             const video = cdnToUse.videoPathList.find(v => v.quality == quality);
+
             if (video) {
                 await ctx.deleteMessage(messageId).catch(err => logger.warn(err, 'Failed to delete previous message.'));
                 const loadingMessage = await ctx.reply(`🔄 Mengambil ${chapter.chapterName}...`);
                 
-                const currentChapterIndex = chapterList.findIndex(c => c.chapterId === chapterId);
-                const prevChapter = (currentChapterIndex > 0) ? chapterList[currentChapterIndex - 1] : null;
-                const nextChapter = (currentChapterIndex !== -1 && currentChapterIndex < chapterList.length - 1) ? chapterList[currentChapterIndex + 1] : null;
+                const tempDir = './temp';
+                if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
+                const tempFilePath = path.join(tempDir, `${chapterId}.mp4`);
+                
+                try {
+                    await downloadFile(video.videoPath, tempFilePath);
+                    logger.info(`Downloaded video to ${tempFilePath}`);
 
-                const navigationButtons = [];
-                if (prevChapter) {
-                    navigationButtons.push(Markup.button.callback(`⬅️ Previous (${prevChapter.chapterName})`, `c:${prevChapter.chapterId}:${bid}`));
+                    const currentChapterIndex = chapterList.findIndex(c => c.chapterId === chapterId);
+                    const prevChapter = (currentChapterIndex > 0) ? chapterList[currentChapterIndex - 1] : null;
+                    const nextChapter = (currentChapterIndex < chapterList.length - 1) ? chapterList[currentChapterIndex + 1] : null;
+
+                    const navigationButtons = [];
+                    if (prevChapter) navigationButtons.push(Markup.button.callback(`⬅️ Previous (${prevChapter.chapterName})`, `c:${prevChapter.chapterId}:${bid}`));
+                    if (nextChapter) navigationButtons.push(Markup.button.callback(`Next ➡️ (${nextChapter.chapterName})`, `c:${nextChapter.chapterId}:${bid}`));
+
+                    const replyMarkup = navigationButtons.length > 0 ? Markup.inlineKeyboard(navigationButtons) : undefined;
+
+                    await ctx.replyWithVideo({ source: tempFilePath }, {
+                        caption: `🎬 *${chapter.chapterName}*`,
+                        parse_mode: 'Markdown',
+                        ...replyMarkup
+                    });
+                    
+                    await ctx.deleteMessage(loadingMessage.message_id);
+                    fs.unlinkSync(tempFilePath);
+                    logger.info(`Sent video and cleaned up temp file for ${chapter.chapterName}`);
+
+                    let session = userSessions.get(chatId) || { videosSent: 0 };
+                    session.videosSent++;
+                    userSessions.set(chatId, session);
+
+                    if (session.videosSent % 3 === 0) {
+                        await ctx.reply(`📡 ✅ Episode ${chapter.chapterName} berhasil dikirim.\nInfo update follow channel telegram : t.me/onesecvip`);
+                        logger.info(`Sent promotional message to ${ctx.from.username}`);
+                    }
+                } catch (downloadError) {
+                    logger.error(downloadError, 'Failed to download or send video file.');
+                    await ctx.deleteMessage(loadingMessage.message_id).catch(err => logger.warn(err, 'Failed to delete loading message.'));
+                    ctx.reply('Sorry, there was an error downloading the video. Please try again.');
                 }
-                if (nextChapter) {
-                    navigationButtons.push(Markup.button.callback(`Next ➡️ (${nextChapter.chapterName})`, `c:${nextChapter.chapterId}:${bid}`));
-                }
 
-                const replyMarkup = navigationButtons.length > 0 ? Markup.inlineKeyboard(navigationButtons) : undefined;
-
-                await ctx.replyWithVideo(video.videoPath, {
-                    caption: `🎬 *${chapter.chapterName}*`,
-                    parse_mode: 'Markdown',
-                    ...replyMarkup
-                });
-                logger.info(`Sent video to ${ctx.from.username} for chapter: ${chapter.chapterName}`);
-                await ctx.deleteMessage(loadingMessage.message_id);
-
-                // Promotional message logic
-                let session = userSessions.get(chatId) || { videosSent: 0 };
-                session.videosSent++;
-                userSessions.set(chatId, session);
-
-                if (session.videosSent % 3 === 0) {
-                    await ctx.reply(`📡 ✅ Episode ${chapter.chapterName} berhasil dikirim.\nInfo update follow channel telegram : t.me/onesecvip`);
-                    logger.info(`Sent promotional message to ${ctx.from.username}`);
-                }
             } else {
                 logger.error(`Video quality not found: ${quality} for chapter: ${chapter.chapterName}`);
                 await ctx.answerCbQuery('Video quality not found.');
