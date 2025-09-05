@@ -10,3 +10,4 @@ obfuscate.js
 
 # Log files
 *.log
+temp/
