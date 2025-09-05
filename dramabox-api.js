@@ -1,8 +1,47 @@
 const axios = require('axios');
 const logger = require('./logger');
+const { v4: uuidv4 } = require('uuid');
 
-// This function makes a single API call for a given index.
-async function fetchDramaBoxPage(bookId, index = 1) {
+let apiToken = null;
+
+async function fetchNewToken() {
+  const url = 'https://sapi.dramaboxdb.com/drama-box/ap001/bootstrap?timestamp=' + Date.now();
+  const payload = { "distinctId": "cc85be1f8166bd67" };
+  const headers = {
+    'Host': 'sapi.dramaboxdb.com',
+    'Version': '430',
+    'Cid': 'DAUAG1050213',
+    'Package-Name': 'com.storymatrix.drama',
+    'Apn': '2',
+    'Device-Id': uuidv4(),
+    'Android-Id': 'ffffffff8315e7318315e73100000007',
+    'Language': 'en',
+    'Current-Language': 'en',
+    'P': '43',
+    'Content-Type': 'application/json; charset=UTF-8',
+    'User-Agent': 'okhttp/4.10.0'
+  };
+  try {
+    logger.info('Fetching new API token...');
+    const response = await axios.post(url, payload, { headers });
+    if (response.data && response.data.data && response.data.data.user && response.data.data.user.token) {
+        apiToken = response.data.data.user.token;
+        logger.info('Successfully fetched and cached new API token.');
+        return apiToken;
+    }
+    logger.error({ message: 'Token not found in bootstrap response', response: response.data });
+    throw new Error('Token not found in bootstrap response');
+  } catch (error) {
+    logger.error(error, 'Failed to get token');
+    throw error;
+  }
+}
+
+async function fetchDramaBoxPage(bookId, index = 1, retries = 15) {
+  if (!apiToken) {
+      await fetchNewToken();
+  }
+
   const url = `https://sapi.dramaboxdb.com/drama-box/chapterv2/batch/load?timestamp=${Date.now()}`;
   const payload = {
     "boundaryIndex": 0,
@@ -20,14 +59,14 @@ async function fetchDramaBoxPage(bookId, index = 1) {
   };
   const headers = {
     'Host': 'sapi.dramaboxdb.com',
-    'Tn': 'Bearer ZXlKMGVYQWlPaUpLVjFRaUxDSmhiR2NpT2lKSVV6STFOaUo5LmV5SnlaV2RwYzNSbGNsUjVjR1VpT2lKVVJVMVFJaXdpZFhObGNrbGtJam95Tnprek5ESTBOVEo5LlZXbGZXS0YxekxjdVZUa20xR0kyaUhFbmo5LVk3S3hDQTVGbXRfSXJSQ1U=',
+    'Tn': `Bearer ${apiToken}`,
     'Version': '430',
     'Vn': '4.3.0',
     'Userid': '279342452',
     'Cid': 'DRA1000042',
     'Package-Name': 'com.storymatrix.drama',
     'Apn': '2',
-    'Device-Id': '3034a68e-60e1-4b02-bb3e-811eaa8d0617',
+    'Device-Id': uuidv4(),
     'Android-Id': 'ffffffff8315e7318315e73100000000',
     'Language': 'en',
     'Current-Language': 'en',
@@ -47,14 +86,27 @@ async function fetchDramaBoxPage(bookId, index = 1) {
 
   try {
     const response = await axios.post(url, payload, { headers });
+    if (response.data && response.data.status === 2 && response.data.message === "接口鉴权不合法") {
+        logger.warn(`Authentication error detected (status 2). Retries left: ${retries - 1}`);
+        if (retries > 0) {
+            apiToken = null;
+            return fetchDramaBoxPage(bookId, index, retries - 1);
+        } else {
+            throw new Error('Failed to authenticate with API after multiple retries.');
+        }
+    }
     return response.data;
   } catch (error) {
     logger.error(error, `Failed to fetch page for bookId: ${bookId}, index: ${index}`);
+    if (error.response && (error.response.status === 401 || error.response.status === 403) && retries > 0) {
+        logger.warn(`Auth error (401/403). Retries left: ${retries - 1}`);
+        apiToken = null;
+        return fetchDramaBoxPage(bookId, index, retries - 1);
+    }
     throw error;
   }
 }
 
-// This function fetches the initial data and then loops to get all chapters.
 async function fetchAllDramaData(bookId) {
     logger.info(`Starting full data fetch for bookId: ${bookId}`);
     const initialResponse = await fetchDramaBoxPage(bookId, 1);
@@ -65,58 +117,46 @@ async function fetchAllDramaData(bookId) {
     }
 
     const { chapterCount } = initialResponse.data;
-    let allChapters = [...initialResponse.data.chapterList];
-    const fetchedIndices = new Set(allChapters.map(c => c.chapterIndex));
+    const allChaptersMap = new Map();
+    initialResponse.data.chapterList.forEach(c => allChaptersMap.set(c.chapterId, c));
     
-    let lastFoundIndex = Math.max(...Array.from(fetchedIndices));
-    let consecutiveEmptyFetches = 0;
+    let lastHighestIndex = Math.max(...Array.from(allChaptersMap.values()).map(c => c.chapterIndex));
 
-    while (allChapters.length < chapterCount && consecutiveEmptyFetches < 5) {
-        // The API seems to return about 6 chapters, so we jump ahead from the last known index.
-        const nextIndexToTry = lastFoundIndex + 1;
-        logger.info(`Fetching chapter page with index: ${nextIndexToTry} for bookId: ${bookId}`);
+    while (allChaptersMap.size < chapterCount) {
+        const nextIndexToTry = lastHighestIndex + 1;
         
+        if (nextIndexToTry > chapterCount + 20) {
+            logger.warn(`Breaking fetch loop to prevent infinite recursion.`);
+            break;
+        }
+
+        logger.info(`Fetching chapter page with index: ${nextIndexToTry} for bookId: ${bookId}`);
         const pageResponse = await fetchDramaBoxPage(bookId, nextIndexToTry);
 
         if (pageResponse && pageResponse.data && pageResponse.data.chapterList && pageResponse.data.chapterList.length > 0) {
-            const newChapters = pageResponse.data.chapterList.filter(
-                (chapter) => !fetchedIndices.has(chapter.chapterIndex)
-            );
-
-            if (newChapters.length > 0) {
-                allChapters.push(...newChapters);
-                newChapters.forEach(c => fetchedIndices.add(c.chapterIndex));
-                lastFoundIndex = Math.max(...Array.from(fetchedIndices));
-                consecutiveEmptyFetches = 0; // Reset counter on success
-            } else {
-                // This page had no new chapters, but we should still continue from the last known index.
-                logger.warn(`No new chapters found at index ${nextIndexToTry}, but continuing search.`);
-                lastFoundIndex++; // Increment to avoid getting stuck
-                consecutiveEmptyFetches++;
+            pageResponse.data.chapterList.forEach(c => allChaptersMap.set(c.chapterId, c));
+            const newHighestIndex = Math.max(...Array.from(allChaptersMap.values()).map(c => c.chapterIndex));
+            
+            if (newHighestIndex === lastHighestIndex) {
+                logger.warn(`No progress in fetching chapters. Breaking loop.`);
+                break;
             }
+            lastHighestIndex = newHighestIndex;
         } else {
-            // The response was empty or invalid.
-            logger.warn(`Stopping fetch loop. No data returned at index ${nextIndexToTry}.`);
-            consecutiveEmptyFetches++;
-            lastFoundIndex++; // Increment to avoid getting stuck
+            logger.warn(`Fetch at index ${nextIndexToTry} returned no chapter list. Breaking loop.`);
+            break;
         }
     }
     
-    if (consecutiveEmptyFetches >= 5) {
-        logger.warn(`Exiting fetch loop after 5 consecutive empty fetches. Found ${allChapters.length}/${chapterCount} chapters.`);
-    }
-
-    // Sort chapters by index to ensure correct order
+    const allChapters = Array.from(allChaptersMap.values());
     allChapters.sort((a, b) => a.chapterIndex - b.chapterIndex);
-    logger.info(`Completed full data fetch for bookId: ${bookId}. Found ${allChapters.length} chapters.`);
+    logger.info(`Completed full data fetch for bookId: ${bookId}. Found ${allChapters.length}/${chapterCount} chapters.`);
 
-    // Return the initial response's metadata but with the complete chapter list.
     return {
         ...initialResponse.data,
         chapterList: allChapters,
     };
 }
-
 
 module.exports = {
   fetchAllDramaData,

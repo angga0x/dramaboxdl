@@ -6,7 +6,8 @@ const token = process.env.TELEGRAM_BOT_TOKEN;
 const bot = new Telegraf(token);
 
 const apiCache = new Map();
-const PAGE_SIZE = 10; // 5 rows of 2 buttons
+const userSessions = new Map(); // To track user activity
+const PAGE_SIZE = 10;
 
 // Helper function to create the paginated keyboard
 function createChapterKeyboard(chapterList, bid, page = 0) {
@@ -26,7 +27,6 @@ function createChapterKeyboard(chapterList, bid, page = 0) {
         navigationButtons.push(Markup.button.callback('Next ➡️', `p:${page + 1}:${bid}`));
     }
 
-    // Create a 2-column layout for chapters
     const chapterRows = [];
     for (let i = 0; i < buttons.length; i += 2) {
         chapterRows.push(buttons.slice(i, i + 2));
@@ -41,7 +41,8 @@ function createChapterKeyboard(chapterList, bid, page = 0) {
 
 bot.start((ctx) => {
   logger.info(`Received /start command from ${ctx.from.username}`);
-  ctx.reply("🎬 Selamat datang di DramaBox Streaming Bot! Kirim link DramaBox nya...");
+  userSessions.set(ctx.chat.id, { videosSent: 0 }); // Initialize session
+  ctx.reply("🎬 Selamat datang di DramaBox Streaming Bot! Hanya kirim URL saja...");
 });
 
 bot.on('text', async (ctx) => {
@@ -101,13 +102,13 @@ bot.on('callback_query', async (ctx) => {
         
         let bid, chapterId, quality, page;
 
-        const chapterList = apiCache.get(args[args.length - 1]); // BID is always last
+        const chapterList = apiCache.get(args[args.length - 1]);
         if (!chapterList) {
             logger.error(`Cache miss for bookId: ${args[args.length - 1]}. User: ${ctx.from.username}`);
             return ctx.answerCbQuery('Session expired. Please send the DramaBox link again.', { show_alert: true });
         }
 
-        if (type === 'p') { // Pagination
+        if (type === 'p') {
             [page, bid] = args;
             const keyboard = createChapterKeyboard(chapterList, bid, parseInt(page, 10));
             await ctx.editMessageReplyMarkup(keyboard.reply_markup);
@@ -120,7 +121,7 @@ bot.on('callback_query', async (ctx) => {
             return ctx.answerCbQuery('Chapter not found. Please try again.');
         }
 
-        if (type === 'c') { // Chapter selection
+        if (type === 'c') {
             [chapterId, bid] = args;
             const nakaCdn = chapter.cdnList.find(cdn => cdn.cdnDomain === "nakavideo.dramaboxdb.com");
             const cdnToUse = nakaCdn || chapter.cdnList[0];
@@ -134,36 +135,47 @@ bot.on('callback_query', async (ctx) => {
             });
             logger.info(`Sent quality selection to ${ctx.from.username} for chapter: ${chapter.chapterName}`);
         
-        } else if (type === 'q') { // Quality selection
+        } else if (type === 'q') {
             [chapterId, quality, bid] = args;
             const nakaCdn = chapter.cdnList.find(cdn => cdn.cdnDomain === "nakavideo.dramaboxdb.com");
             const cdnToUse = nakaCdn || chapter.cdnList[0];
 
             const video = cdnToUse.videoPathList.find(v => v.quality == quality);
             if (video) {
-                await ctx.deleteMessage(messageId).catch(err => logger.warn(err, 'Failed to delete previous message. It might have been deleted already.'));
+                await ctx.deleteMessage(messageId).catch(err => logger.warn(err, 'Failed to delete previous message.'));
                 const loadingMessage = await ctx.reply(`🔄 Mengambil ${chapter.chapterName}...`);
                 
-                // Find the next chapter to create the "Next Episode" button
                 const currentChapterIndex = chapterList.findIndex(c => c.chapterId === chapterId);
-                const nextChapter = (currentChapterIndex !== -1 && currentChapterIndex < chapterList.length - 1)
-                    ? chapterList[currentChapterIndex + 1]
-                    : null;
+                const prevChapter = (currentChapterIndex > 0) ? chapterList[currentChapterIndex - 1] : null;
+                const nextChapter = (currentChapterIndex !== -1 && currentChapterIndex < chapterList.length - 1) ? chapterList[currentChapterIndex + 1] : null;
 
-                const replyMarkup = nextChapter
-                    ? Markup.inlineKeyboard([
-                        Markup.button.callback(`Next Episode ➡️ (${nextChapter.chapterName})`, `c:${nextChapter.chapterId}:${bid}`)
-                      ])
-                    : undefined;
+                const navigationButtons = [];
+                if (prevChapter) {
+                    navigationButtons.push(Markup.button.callback(`⬅️ Previous (${prevChapter.chapterName})`, `c:${prevChapter.chapterId}:${bid}`));
+                }
+                if (nextChapter) {
+                    navigationButtons.push(Markup.button.callback(`Next ➡️ (${nextChapter.chapterName})`, `c:${nextChapter.chapterId}:${bid}`));
+                }
+
+                const replyMarkup = navigationButtons.length > 0 ? Markup.inlineKeyboard(navigationButtons) : undefined;
 
                 await ctx.replyWithVideo(video.videoPath, {
                     caption: `🎬 *${chapter.chapterName}*`,
                     parse_mode: 'Markdown',
                     ...replyMarkup
                 });
-                logger.info(`Sent video to ${ctx.from.username} for chapter: ${chapter.chapterName}, quality: ${video.quality}p`);
-
+                logger.info(`Sent video to ${ctx.from.username} for chapter: ${chapter.chapterName}`);
                 await ctx.deleteMessage(loadingMessage.message_id);
+
+                // Promotional message logic
+                let session = userSessions.get(chatId) || { videosSent: 0 };
+                session.videosSent++;
+                userSessions.set(chatId, session);
+
+                if (session.videosSent % 3 === 0) {
+                    await ctx.reply(`📡 ✅ Episode ${chapter.chapterName} berhasil dikirim.\nInfo update follow channel telegram : t.me/onesecvip`);
+                    logger.info(`Sent promotional message to ${ctx.from.username}`);
+                }
             } else {
                 logger.error(`Video quality not found: ${quality} for chapter: ${chapter.chapterName}`);
                 await ctx.answerCbQuery('Video quality not found.');
